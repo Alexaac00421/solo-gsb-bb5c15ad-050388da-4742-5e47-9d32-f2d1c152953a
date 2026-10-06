@@ -46,6 +46,15 @@ class CorrectionRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500, description="补正原因（非空；空缺 -> 422 拒绝）")
 
 
+class WithdrawalRequest(BaseModel):
+    """已受理交接批次撤回请求（原交接记录与其 record_hash 永不改写，只追加撤回）。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    batch_id: str = Field(min_length=1, max_length=64, description="被撤回的批次号（须为该展品最新且 ACCEPTED 的批次）")
+    reason: str = Field(min_length=1, max_length=500, description="撤回原因（非空；空缺 -> 422 拒绝）")
+
+
 class ReasonOut(BaseModel):
     rule: str
     message: str
@@ -99,6 +108,11 @@ class ExhibitOut(BaseModel):
     # 补正链状态（新增字段；补正不推进交接链，故上面 chain_length/chain_head_hash 不变）
     correction_chain_length: Optional[int] = 0
     correction_head_hash: Optional[str] = None
+    # 撤回链状态（新增字段；撤回不删除原链，chain_length/chain_head_hash 保持不变）
+    withdrawal_chain_length: Optional[int] = 0
+    withdrawal_head_hash: Optional[str] = None
+    # 撤回后按撤回链计算的有效交接链长度（= chain_length 减去被撤回批次的记录数）
+    effective_chain_length: Optional[int] = None
 
 
 class HandoverRecordOut(BaseModel):
@@ -120,6 +134,21 @@ class HandoverRecordOut(BaseModel):
     # 当前有效摘要（无补正则等于原 voucher_digest）与该环节的补正轨迹
     current_voucher_digest: Optional[str] = None
     correction_trail: list["CorrectionTrailItem"] = Field(default_factory=list)
+    # 撤回引入的新字段（原字段保持不变，向后兼容）：该环节所属批次的撤回状态。
+    # 被撤回时 withdrawn=true 并附撤回引用；原记录、原哈希仍完整保留在链上。
+    withdrawn: bool = False
+    withdrawal: Optional["WithdrawalRefOut"] = None
+
+
+class WithdrawalRefOut(BaseModel):
+    """交接记录/批次上引用的撤回信息（撤回链中对应环的摘要）。"""
+
+    withdrawal_id: str
+    withdrawal_seq: int
+    batch_id: str
+    reason: str
+    record_hash: str
+    created_at: datetime
 
 
 class CorrectionTrailItem(BaseModel):
@@ -156,6 +185,31 @@ class CorrectionOut(BaseModel):
     created_at: datetime
 
 
+class WithdrawalOut(BaseModel):
+    """撤回结果（首次受理 201；同键同载荷重放 200）。
+
+    撤回只追加不可变撤回记录：返回撤回后的有效链上状态，
+    并携带被撤回批次的全部交接记录 record_hash 锚点。
+    """
+
+    withdrawal_id: str
+    exhibit_id: str
+    batch_id: str
+    reason: str
+    anchor_record_hashes: list[str]
+    withdrawal_seq: int
+    prev_hash: str
+    record_hash: str
+    idempotent_replay: bool
+    created_at: datetime
+    # 撤回后按撤回链计算的展品当前有效状态
+    chain_length: int = Field(description="原交接链历史长度（撤回不删除记录，保持不变）")
+    effective_chain_length: int = Field(description="撤回后的有效交接链长度")
+    custodian: str = Field(description="撤回后的当前保管人")
+    current_seal: str = Field(description="撤回后的当前封签")
+    last_time: Optional[datetime] = Field(default=None, description="撤回后最近一次有效交接时间")
+
+
 class ChainAuditBlock(BaseModel):
     """审计复算结果中的一条链（交接链 / 补正链）。"""
 
@@ -168,7 +222,8 @@ class ChainAuditBlock(BaseModel):
 
 class ChainOut(BaseModel):
     exhibit_id: str
-    chain_length: int
+    chain_length: int = Field(description="原交接链历史长度（撤回不删除记录，长度保持不变）")
+    effective_chain_length: Optional[int] = Field(default=None, description="按撤回链排除被撤回批次后的有效链长度")
     records: list[HandoverRecordOut]
 
 
@@ -182,6 +237,10 @@ class AuditVerifyOut(BaseModel):
     correction_chain_length: Optional[int] = 0
     corrections_chain: Optional[ChainAuditBlock] = None
     handover_chain: Optional[ChainAuditBlock] = None
+    # 撤回引入：同时复算撤回链并校验撤回后展品有效状态（新增字段，向后兼容）
+    withdrawal_chain_length: Optional[int] = 0
+    withdrawals_chain: Optional[ChainAuditBlock] = None
+    effective_chain_length: Optional[int] = None
 
 
 class BatchSummary(BaseModel):
@@ -190,6 +249,9 @@ class BatchSummary(BaseModel):
     record_count: int
     first_break: Optional[FirstBreakOut]
     created_at: datetime
+    # 撤回引入：批次是否已被撤回及其撤回引用（新增字段，向后兼容）
+    withdrawn: bool = False
+    withdrawal: Optional[WithdrawalRefOut] = None
 
 
 class HandoverTokenOut(BaseModel):

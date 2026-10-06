@@ -14,10 +14,13 @@ from .db import get_conn, wait_for_db
 from .hashing import (
     CORRECTIONS_GENESIS_HASH,
     GENESIS_HASH,
+    WITHDRAWALS_GENESIS_HASH,
     correction_hash,
     correction_request_hash,
     record_hash,
     request_hash,
+    withdrawal_hash,
+    withdrawal_request_hash,
 )
 from .migrations import ensure_schema
 from .schemas import (
@@ -32,6 +35,8 @@ from .schemas import (
     ExhibitOut,
     HandoverRecordOut,
     RehearsalOut,
+    WithdrawalOut,
+    WithdrawalRequest,
 )
 from .tokens import (
     InvalidTokenError,
@@ -61,14 +66,91 @@ app = FastAPI(
 # ---------------------------------------------------------------- 工具
 
 
-def _exhibit_state(row: dict) -> ExhibitState:
+def _withdrawn_batch_ids(conn, exhibit_id: str) -> set[uuid.UUID]:
+    """该展品全部已撤回批次的 batch_id 集合（撤回链按批次只追加、不可撤销）。"""
+    rows = conn.execute(
+        "SELECT batch_id FROM batch_withdrawals WHERE exhibit_id = %s",
+        (exhibit_id,),
+    ).fetchall()
+    return {r["batch_id"] for r in rows}
+
+
+def _effective_chain_rows(conn, exhibit: dict, withdrawn: set[uuid.UUID]) -> list[dict]:
+    """按撤回链排除被撤回批次后的有效交接记录（按 chain_seq 有序）。"""
+    rows = conn.execute(
+        """
+        SELECT * FROM handover_records
+         WHERE exhibit_id = %s
+         ORDER BY chain_seq
+        """,
+        (exhibit["exhibit_id"],),
+    ).fetchall()
+    return [r for r in rows if r["batch_id"] not in withdrawn]
+
+
+def _effective_state(conn, exhibit: dict, withdrawn: set[uuid.UUID] | None = None) -> dict:
+    """撤回后展品当前有效状态：保管人/封签/最近时间/有效链长。
+
+    撤回不删除、不改写任何原交接记录，也不改变 chain_length/chain_head_hash；
+    当前状态由「排除被撤回批次后的最后一环有效记录」重放得出。
+    有效链为空（全部撤回或尚未交接）时回退到登记状态。
+    """
+    if withdrawn is None:
+        withdrawn = _withdrawn_batch_ids(conn, exhibit["exhibit_id"])
+    effective = _effective_chain_rows(conn, exhibit, withdrawn)
+    if effective:
+        last = effective[-1]
+        return {
+            "custodian": last["to_person"],
+            "current_seal": last["seal_no"],
+            "last_time": last["occurred_at"],
+            "effective_chain_length": len(effective),
+        }
+    # 有效链为空：回退到登记保管人/初始封签（旧卷可能无登记列，以首环字段兜底）
+    custodian = exhibit.get("registered_custodian")
+    seal = exhibit.get("registered_initial_seal")
+    first = conn.execute(
+        """
+        SELECT from_person, seal_no FROM handover_records
+         WHERE exhibit_id = %s ORDER BY chain_seq LIMIT 1
+        """,
+        (exhibit["exhibit_id"],),
+    ).fetchone()
+    if custodian is None and first is not None:
+        custodian = first["from_person"]
+    if seal is None and first is not None:
+        seal = first["seal_no"]
+    return {
+        "custodian": custodian or exhibit["custodian"],
+        "current_seal": seal or exhibit["current_seal"],
+        "last_time": None,
+        "effective_chain_length": 0,
+    }
+
+
+def _exhibit_state(row: dict, effective: dict | None = None) -> ExhibitState:
+    """构造规则引擎参照状态。
+
+    默认使用展品当前（物理）状态；撤回后提交/预演须传入按撤回链计算的
+    有效状态（保管人/封签/最近时间/有效链长），使首站等规则以撤回后状态为基准。
+    """
+    if effective is None:
+        custodian = row["custodian"]
+        current_seal = row["current_seal"]
+        last_time = row["last_time"]
+        chain_length = row["chain_length"]
+    else:
+        custodian = effective["custodian"]
+        current_seal = effective["current_seal"]
+        last_time = effective["last_time"]
+        chain_length = effective["effective_chain_length"]
     return ExhibitState(
         exhibit_id=row["exhibit_id"],
         home_location=row["home_location"],
-        custodian=row["custodian"],
-        current_seal=row["current_seal"],
-        last_time=row["last_time"],
-        chain_length=row["chain_length"],
+        custodian=custodian,
+        current_seal=current_seal,
+        last_time=last_time,
+        chain_length=chain_length,
     )
 
 
@@ -165,6 +247,199 @@ def _load_corrections_by_target(conn, exhibit_id: str) -> dict[int, list[dict]]:
 def _current_digest(original_digest: str, trail: list[dict] | None) -> str:
     """当前有效摘要：该环节最后一笔补正的 new_digest；无补正即原摘要。"""
     return trail[-1]["new_digest"] if trail else original_digest
+
+
+# ---------------------------------------------------------------- 撤回
+
+
+def _withdrawal_ref(row: dict) -> dict:
+    return {
+        "withdrawal_id": str(row["withdrawal_id"]),
+        "withdrawal_seq": row["withdrawal_seq"],
+        "batch_id": str(row["batch_id"]),
+        "reason": row["reason"],
+        "record_hash": row["record_hash"],
+        "created_at": row["created_at"].isoformat(),
+    }
+
+
+def _load_withdrawals(conn, exhibit_id: str) -> list[dict]:
+    """按撤回时序取展品的全部撤回记录（用于标注交接记录/批次与计算有效状态）。"""
+    return conn.execute(
+        """
+        SELECT withdrawal_id, exhibit_id, batch_id, reason, anchor_record_hashes,
+               withdrawal_seq, prev_hash, record_hash, request_hash, created_at
+          FROM batch_withdrawals
+         WHERE exhibit_id = %s
+         ORDER BY withdrawal_seq
+        """,
+        (exhibit_id,),
+    ).fetchall()
+
+
+def _withdrawal_replay(row: dict) -> dict:
+    """幂等重放：返回首次受理响应快照，并标记为重放（200）。"""
+    result = dict(row["result"])
+    result["idempotent_replay"] = True
+    return result
+
+
+def _verify_withdrawals_chain(conn, exhibit: dict, records: list[dict],
+                              honest_hashes: dict[int, str]) -> dict:
+    """复算撤回链并校验撤回后展品有效状态。
+
+    每环校验：
+    - prev_hash 衔接与 record_hash 复算（含撤回业务字段和锚点列表）；
+    - 被撤回批次存在、属于该展品且为 ACCEPTED；
+    - 锚点列表与该批次现存交接记录的存储 record_hash 及诚实重算哈希
+      逐条一致——原记录被删除/改写或锚点被伪造都在首个引用环定位。
+
+    链尾另校验：撤回链头/链长与展品状态一致；
+    按撤回链排除被撤回批次后重放的有效保管人/封签/最近时间，
+    须与展品当前列一致（否则说明撤回状态没有正确落地）。
+    """
+    rows = conn.execute(
+        "SELECT * FROM batch_withdrawals WHERE exhibit_id = %s ORDER BY withdrawal_seq",
+        (exhibit["exhibit_id"],),
+    ).fetchall()
+    records_by_batch: dict[uuid.UUID, list[dict]] = {}
+    for r in records:
+        records_by_batch.setdefault(r["batch_id"], []).append(r)
+
+    batch_cache: dict[uuid.UUID, dict] = {}
+
+    def _batch(batch_id: uuid.UUID) -> dict | None:
+        if batch_id not in batch_cache:
+            batch_cache[batch_id] = conn.execute(
+                "SELECT * FROM batches WHERE batch_id = %s",
+                (batch_id,),
+            ).fetchone()
+        return batch_cache[batch_id]
+
+    prev = WITHDRAWALS_GENESIS_HASH
+    for row in rows:
+        expected = withdrawal_hash(
+            prev_hash=prev,
+            withdrawal_id=row["withdrawal_id"],
+            exhibit_id=row["exhibit_id"],
+            withdrawal_seq=row["withdrawal_seq"],
+            batch_id=row["batch_id"],
+            reason=row["reason"],
+            anchor_record_hashes=list(row["anchor_record_hashes"]),
+            created_at=row["created_at"],
+        )
+        if row["prev_hash"] != prev or row["record_hash"] != expected:
+            return {
+                "block": {
+                    "chain_length": len(rows),
+                    "head_hash": prev,
+                    "valid": False,
+                    "first_invalid_seq": row["withdrawal_seq"],
+                    "detail": f"撤回链第 {row['withdrawal_seq']} 环哈希校验失败："
+                              "撤回记录被篡改、删除或顺序被调换",
+                },
+                "effective": None,
+            }
+
+        batch = _batch(row["batch_id"])
+        batch_records = sorted(
+            records_by_batch.get(row["batch_id"], []), key=lambda r: r["chain_seq"]
+        )
+        if batch is None or batch["exhibit_id"] != exhibit["exhibit_id"]:
+            return {
+                "block": {
+                    "chain_length": len(rows),
+                    "head_hash": prev,
+                    "valid": False,
+                    "first_invalid_seq": row["withdrawal_seq"],
+                    "detail": f"撤回链第 {row['withdrawal_seq']} 环锚定失效："
+                              f"被撤回批次「{row['batch_id']}」不存在或不属于该展品",
+                },
+                "effective": None,
+            }
+        if batch["status"] != "ACCEPTED":
+            return {
+                "block": {
+                    "chain_length": len(rows),
+                    "head_hash": prev,
+                    "valid": False,
+                    "first_invalid_seq": row["withdrawal_seq"],
+                    "detail": f"撤回链第 {row['withdrawal_seq']} 环锚定失效："
+                              "被撤回批次状态不是 ACCEPTED",
+                },
+                "effective": None,
+            }
+        stored_hashes = [r["record_hash"] for r in batch_records]
+        honest_anchors = [honest_hashes[r["chain_seq"]] for r in batch_records]
+        if list(row["anchor_record_hashes"]) != stored_hashes or stored_hashes != honest_anchors:
+            return {
+                "block": {
+                    "chain_length": len(rows),
+                    "head_hash": prev,
+                    "valid": False,
+                    "first_invalid_seq": row["withdrawal_seq"],
+                    "detail": f"撤回链第 {row['withdrawal_seq']} 环锚定失效："
+                              "被撤回批次的交接记录不存在、其内容/record_hash 已被改写，"
+                              "或锚点列表与批次记录不一致",
+                },
+                "effective": None,
+            }
+        prev = row["record_hash"]
+
+    if prev != exhibit["withdrawal_head_hash"] or len(rows) != exhibit["withdrawal_chain_length"]:
+        return {
+            "block": {
+                "chain_length": len(rows),
+                "head_hash": prev,
+                "valid": False,
+                "first_invalid_seq": None,
+                "detail": "撤回链尾哈希或链长与展品当前撤回状态不一致",
+            },
+            "effective": None,
+        }
+
+    # 撤回后有效状态一致性：重放有效记录后须与展品当前列一致
+    withdrawn = {r["batch_id"] for r in rows}
+    effective_rows = [r for r in records if r["batch_id"] not in withdrawn]
+    if effective_rows:
+        last = effective_rows[-1]
+        eff_custodian, eff_seal, eff_time = (
+            last["to_person"], last["seal_no"], last["occurred_at"]
+        )
+    else:
+        eff = _effective_state(conn, exhibit, withdrawn)
+        eff_custodian, eff_seal, eff_time = (
+            eff["custodian"], eff["current_seal"], None
+        )
+    if (
+        exhibit["custodian"] != eff_custodian
+        or exhibit["current_seal"] != eff_seal
+        or exhibit["last_time"] != eff_time
+    ):
+        return {
+            "block": {
+                "chain_length": len(rows),
+                "head_hash": prev,
+                "valid": False,
+                "first_invalid_seq": None,
+                "detail": "撤回链完整，但展品当前保管人/封签/最近时间"
+                          "与按撤回链重放的有效状态不一致",
+            },
+            "effective": None,
+        }
+
+    return {
+        "block": {
+            "chain_length": len(rows),
+            "head_hash": prev,
+            "valid": True,
+            "first_invalid_seq": None,
+            "detail": "撤回哈希链完整，各环锚点与原交接记录一致，撤回后有效状态正确",
+        },
+        "effective": {
+            "effective_chain_length": len(effective_rows),
+        },
+    }
 
 
 def _verify_handover_chain(conn, exhibit: dict, records: list[dict]) -> dict:
@@ -329,12 +604,16 @@ def create_exhibit(payload: ExhibitCreate):
         with get_conn() as conn:
             row = conn.execute(
                 """
-                INSERT INTO exhibits (exhibit_id, name, home_location, custodian, current_seal)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO exhibits (exhibit_id, name, home_location, custodian, current_seal,
+                                      registered_custodian, registered_initial_seal)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
-                (payload.exhibit_id, payload.name, payload.home_location, payload.custodian, payload.initial_seal),
+                (payload.exhibit_id, payload.name, payload.home_location, payload.custodian,
+                 payload.initial_seal, payload.custodian, payload.initial_seal),
             ).fetchone()
+            row = dict(row)
+            row["effective_chain_length"] = 0
             return row
     except UniqueViolation:
         raise HTTPException(status_code=409, detail=f"展品「{payload.exhibit_id}」已存在")
@@ -344,8 +623,12 @@ def create_exhibit(payload: ExhibitCreate):
 def get_exhibit(exhibit_id: str):
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM exhibits WHERE exhibit_id = %s", (exhibit_id,)).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在")
+        if not row:
+            raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在")
+        withdrawn = _withdrawn_batch_ids(conn, exhibit_id)
+        effective = _effective_state(conn, row, withdrawn)
+    row = dict(row)
+    row["effective_chain_length"] = effective["effective_chain_length"]
     return row
 
 
@@ -367,11 +650,15 @@ def rehearse_handover_batch(payload: BatchRequest):
             "SELECT * FROM exhibits WHERE exhibit_id = %s",
             (payload.exhibit_id,),
         ).fetchone()
-    if not exhibit:
-        raise HTTPException(status_code=404, detail=f"展品「{payload.exhibit_id}」不存在")
+        if not exhibit:
+            raise HTTPException(status_code=404, detail=f"展品「{payload.exhibit_id}」不存在")
+        # 撤回后预演：以按撤回链计算的有效状态作为规则核验参照（只读，不写任何数据）
+        withdrawn = _withdrawn_batch_ids(conn, payload.exhibit_id)
+        effective = _effective_state(conn, exhibit, withdrawn)
 
-    result = validate_batch(_exhibit_state(exhibit), payload.records)
+    result = validate_batch(_exhibit_state(exhibit, effective), payload.records)
     now = datetime.now(timezone.utc)
+    # 令牌与审计意义上的链快照仍是原交接链（撤回不删除原记录、原链长度不变）
     token = issue_token(
         TOKEN_SECRET,
         payload.exhibit_id,
@@ -475,8 +762,10 @@ def submit_handover_batch(
                                "令牌失效，请重新预演后再提交",
                     )
 
-            # 5) 核验
-            result = validate_batch(_exhibit_state(exhibit), payload.records)
+            # 5) 核验：撤回后以按撤回链计算的有效状态为参照（原链长度/链头不变）
+            withdrawn = _withdrawn_batch_ids(conn, payload.exhibit_id)
+            effective = _effective_state(conn, exhibit, withdrawn)
+            result = validate_batch(_exhibit_state(exhibit, effective), payload.records)
             batch_id = uuid.uuid4()
             now = datetime.now(timezone.utc)
             report = _build_report(batch_id, payload.exhibit_id, result, len(payload.records), now)
@@ -492,8 +781,12 @@ def submit_handover_batch(
 
             # 6) 通过才写交接记录并推进链上状态；失败则只有批次报告落库
             if result.accepted:
+                # 新记录线性追加在原交接链物理链尾：prev_hash 指向上一环（含已被
+                # 撤回的历史环），chain_seq 连续——原链是完整不可变的追加式历史，
+                # 撤回只通过旁路撤回链标记批次失效，绝不打断原哈希链。
+                # 业务参照系（交出人/封签/时间基准）已在第 5 步使用撤回后有效状态。
                 prev_hash = exhibit["chain_head_hash"]
-                prev_seal = exhibit["current_seal"]
+                prev_seal = effective["current_seal"]
                 chain_seq = exhibit["chain_length"]
                 for seq_in_batch, rec in enumerate(payload.records, start=1):
                     chain_seq += 1
@@ -557,6 +850,273 @@ def get_handover_batch(batch_id: uuid.UUID):
     if not row:
         raise HTTPException(status_code=404, detail=f"批次「{batch_id}」不存在")
     return row["report"]
+
+
+# ---------------------------------------------------------------- 已受理批次撤回
+
+
+def _reject_withdrawal(detail: str) -> HTTPException:
+    return HTTPException(status_code=409, detail=detail)
+
+
+@app.post(
+    "/api/v1/exhibits/{exhibit_id}/batch-withdrawals",
+    response_model=WithdrawalOut,
+    status_code=201,
+    tags=["withdrawals"],
+)
+def withdraw_handover_batch(
+    exhibit_id: str,
+    payload: WithdrawalRequest,
+    response: Response,
+    idempotency_key: str = Header(min_length=1, max_length=128),
+):
+    """撤回该展品最新且 ACCEPTED、尚未被补正引用的已受理交接批次。
+
+    - 撤回**不删除、不改写**任何原交接记录与其 `record_hash`，只追加一条
+      不可变撤回记录（展品独立撤回哈希链，首环 `prev_hash=WITHDRAWALS_GENESIS`，
+      锚定被撤回批次全部交接记录的 `record_hash`）。
+    - 原交接链历史长度 `chain_length`/链头保持不变；展品当前保管人、封签、
+      最近时间与有效交接列表按撤回后状态计算（回退到被撤回批次之前）。
+    - 拒绝规则：
+      - 展品/批次不存在，或批次不属于该展品 -> 404；
+      - 原因为空（纯空白）/ 批次号格式非法 -> 422；
+      - 批次状态为 REJECTED -> 409；
+      - 存在比该批次更晚的已受理批次（目标不是最新 ACCEPTED 批次）-> 409；
+      - 该批次交接记录已被任何补正单引用 -> 409；
+      - 该批次已被撤回 -> 409。
+    - 幂等（先于业务校验按幂等键重放）：
+      - 同键同载荷重试 -> 返回首次撤回结果，`idempotent_replay=true`（HTTP 200）；
+      - 同键异载荷 -> 409。
+    """
+    # 0) 入参格式：批次号必须是 UUID（格式非法 -> 422，不落任何记录）
+    try:
+        target_batch_id = uuid.UUID(payload.batch_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=422, detail="batch_id 必须是 UUID 格式的批次号")
+
+    req_hash = withdrawal_request_hash(exhibit_id, target_batch_id, payload.reason)
+
+    try:
+        with get_conn() as conn:
+            # 1) 幂等预检：同键重试即使业务前提已变化，也先返回首次撤回结果
+            existing = conn.execute(
+                "SELECT * FROM batch_withdrawals WHERE idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+            if existing:
+                if existing["request_hash"] != req_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="同一 Idempotency-Key 提交了不同的撤回请求载荷",
+                    )
+                response.status_code = 200
+                return _withdrawal_replay(existing)
+
+            # 2) 锁定展品行：串行化撤回与交接批次链推进/补正
+            exhibit = conn.execute(
+                "SELECT * FROM exhibits WHERE exhibit_id = %s FOR UPDATE",
+                (exhibit_id,),
+            ).fetchone()
+            if not exhibit:
+                raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在")
+
+            # 2b) 行锁内再查一次幂等：串行化同键并发请求
+            existing = conn.execute(
+                "SELECT * FROM batch_withdrawals WHERE idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+            if existing:
+                if existing["request_hash"] != req_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="同一 Idempotency-Key 提交了不同的撤回请求载荷",
+                    )
+                response.status_code = 200
+                return _withdrawal_replay(existing)
+
+            # 3) 目标批次：存在、属于该展品、状态为 ACCEPTED
+            batch = conn.execute(
+                "SELECT * FROM batches WHERE batch_id = %s",
+                (target_batch_id,),
+            ).fetchone()
+            if not batch or batch["exhibit_id"] != exhibit_id:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"展品「{exhibit_id}」不存在批次「{target_batch_id}」",
+                )
+            if batch["status"] != "ACCEPTED":
+                raise _reject_withdrawal(
+                    f"批次「{target_batch_id}」状态为 {batch['status']}，"
+                    "仅允许撤回状态为 ACCEPTED 的批次"
+                )
+
+            batch_records = conn.execute(
+                """
+                SELECT * FROM handover_records
+                 WHERE exhibit_id = %s AND batch_id = %s
+                 ORDER BY chain_seq
+                """,
+                (exhibit_id, target_batch_id),
+            ).fetchall()
+
+            # 4) 必须是该展品当前最新的「未撤回」已受理批次：
+            # 取原链上最后一个不属于已撤回批次的记录所属批次。
+            # 撤回按栈式展开：撤回最新批次后，前一批次成为新的最新批次，
+            # 可继续撤回直至有效链清空。
+            withdrawn_so_far = _withdrawn_batch_ids(conn, exhibit_id)
+            latest_row = conn.execute(
+                """
+                SELECT batch_id FROM handover_records
+                 WHERE exhibit_id = %s
+                 ORDER BY chain_seq DESC
+                """,
+                (exhibit_id,),
+            ).fetchall()
+            latest_batch_id = None
+            for lr in latest_row:
+                if lr["batch_id"] not in withdrawn_so_far:
+                    latest_batch_id = lr["batch_id"]
+                    break
+            if latest_batch_id != target_batch_id:
+                raise _reject_withdrawal(
+                    f"批次「{target_batch_id}」不是展品「{exhibit_id}」最新的已受理批次"
+                    f"（当前最新未撤回已受理批次为「{latest_batch_id}」），"
+                    "存在更晚已受理批次时禁止撤回"
+                )
+
+            # 5) 该批次尚未被补正引用：任一环存在补正单即拒绝
+            referenced = conn.execute(
+                """
+                SELECT 1 FROM digest_corrections c
+                 WHERE c.exhibit_id = %s
+                   AND c.target_chain_seq = ANY(%s)
+                 LIMIT 1
+                """,
+                (exhibit_id, [r["chain_seq"] for r in batch_records]),
+            ).fetchone()
+            if referenced:
+                raise _reject_withdrawal(
+                    f"批次「{target_batch_id}」的交接记录已被补正单引用，禁止撤回"
+                )
+
+            # 6) 未被撤回（撤回栈语义：已撤回的批次不再是有效最新批次）
+            already = conn.execute(
+                "SELECT 1 FROM batch_withdrawals WHERE batch_id = %s",
+                (target_batch_id,),
+            ).fetchone()
+            if already:
+                raise _reject_withdrawal(f"批次「{target_batch_id}」已被撤回，不可重复撤回")
+
+            # 7) 追加不可变撤回记录：锚定被撤回批次全部交接记录的 record_hash
+            anchor_hashes = [r["record_hash"] for r in batch_records]
+            withdrawal_id = uuid.uuid4()
+            now = datetime.now(timezone.utc)
+            withdrawal_seq = exhibit["withdrawal_chain_length"] + 1
+            prev_hash = exhibit["withdrawal_head_hash"]
+            h = withdrawal_hash(
+                prev_hash=prev_hash,
+                withdrawal_id=withdrawal_id,
+                exhibit_id=exhibit_id,
+                withdrawal_seq=withdrawal_seq,
+                batch_id=target_batch_id,
+                reason=payload.reason,
+                anchor_record_hashes=anchor_hashes,
+                created_at=now,
+            )
+
+            # 8) 撤回后有效状态（不触碰 chain_length/chain_head_hash 与任何交接记录）
+            withdrawn = _withdrawn_batch_ids(conn, exhibit_id)
+            withdrawn.add(target_batch_id)
+            effective = _effective_state(conn, exhibit, withdrawn)
+
+            result_body = {
+                "withdrawal_id": str(withdrawal_id),
+                "exhibit_id": exhibit_id,
+                "batch_id": str(target_batch_id),
+                "reason": payload.reason,
+                "anchor_record_hashes": anchor_hashes,
+                "withdrawal_seq": withdrawal_seq,
+                "prev_hash": prev_hash,
+                "record_hash": h,
+                "idempotent_replay": False,
+                "created_at": now.isoformat(),
+                "chain_length": exhibit["chain_length"],
+                "effective_chain_length": effective["effective_chain_length"],
+                "custodian": effective["custodian"],
+                "current_seal": effective["current_seal"],
+                "last_time": effective["last_time"].isoformat() if effective["last_time"] else None,
+            }
+
+            conn.execute(
+                """
+                INSERT INTO batch_withdrawals
+                    (withdrawal_id, idempotency_key, exhibit_id, batch_id, reason,
+                     anchor_record_hashes, withdrawal_seq, prev_hash, record_hash,
+                     request_hash, result, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (withdrawal_id, idempotency_key, exhibit_id, target_batch_id, payload.reason,
+                 Jsonb(anchor_hashes), withdrawal_seq, prev_hash, h,
+                 req_hash, Jsonb(result_body), now),
+            )
+            conn.execute(
+                """
+                UPDATE exhibits
+                   SET withdrawal_chain_length = %s, withdrawal_head_hash = %s,
+                       custodian = %s, current_seal = %s, last_time = %s
+                 WHERE exhibit_id = %s
+                """,
+                (withdrawal_seq, h, effective["custodian"], effective["current_seal"],
+                 effective["last_time"], exhibit_id),
+            )
+
+            return result_body
+    except UniqueViolation:
+        # 并发下同键插入或同批次撤回：回滚后按已存在记录判定（等价后到重试/冲突）
+        with get_conn() as conn:
+            existing = conn.execute(
+                "SELECT * FROM batch_withdrawals WHERE idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+        if existing and existing["request_hash"] == req_hash:
+            response.status_code = 200
+            return _withdrawal_replay(existing)
+        raise HTTPException(status_code=409, detail="撤回冲突：同一幂等键提交了不同载荷，或该批次已被并发撤回")
+
+
+@app.get(
+    "/api/v1/exhibits/{exhibit_id}/batch-withdrawals",
+    response_model=list[WithdrawalOut],
+    tags=["withdrawals"],
+)
+def list_batch_withdrawals(
+    exhibit_id: str,
+    batch_id: uuid.UUID | None = Query(default=None, description="仅返回指定批次的撤回记录"),
+):
+    """查询展品的撤回链（撤回时序；可按被撤回批次过滤）。"""
+    with get_conn() as conn:
+        exhibit = conn.execute(
+            "SELECT 1 FROM exhibits WHERE exhibit_id = %s", (exhibit_id,)
+        ).fetchone()
+        if not exhibit:
+            raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在")
+        if batch_id is None:
+            rows = conn.execute(
+                "SELECT * FROM batch_withdrawals WHERE exhibit_id = %s ORDER BY withdrawal_seq",
+                (exhibit_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM batch_withdrawals
+                 WHERE exhibit_id = %s AND batch_id = %s
+                 ORDER BY withdrawal_seq
+                """,
+                (exhibit_id, batch_id),
+            ).fetchall()
+    return [r["result"] for r in rows]
+
 
 
 # ---------------------------------------------------------------- 凭证摘要补正
@@ -786,8 +1346,10 @@ def get_handover_record(exhibit_id: str, chain_seq: int):
         if not row:
             raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在链序号 {chain_seq} 的交接记录")
         trail_map = _load_corrections_by_target(conn, exhibit_id)
+        withdrawals = _load_withdrawals(conn, exhibit_id)
 
     trail = trail_map.get(chain_seq, [])
+    wd = next((w for w in withdrawals if w["batch_id"] == row["batch_id"]), None)
     return {
         "chain_seq": row["chain_seq"],
         "batch_id": str(row["batch_id"]),
@@ -805,6 +1367,8 @@ def get_handover_record(exhibit_id: str, chain_seq: int):
         "created_at": row["created_at"],
         "current_voucher_digest": _current_digest(row["voucher_digest"], trail),
         "correction_trail": trail,
+        "withdrawn": wd is not None,
+        "withdrawal": _withdrawal_ref(wd) if wd else None,
     }
 
 
@@ -812,8 +1376,16 @@ def get_handover_record(exhibit_id: str, chain_seq: int):
 
 
 @app.get("/api/v1/exhibits/{exhibit_id}/handovers", response_model=ChainOut, tags=["audit"])
-def list_handovers(exhibit_id: str):
+def list_handovers(
+    exhibit_id: str,
+    effective_only: bool = Query(default=False, description="为 true 时仅返回撤回后的有效交接记录；默认返回完整原链历史"),
+):
     """查询展品的完整交接链（含每条记录的链式哈希）。
+
+    撤回不删除、不改写任何原交接记录：默认返回完整原链历史
+    （`chain_length` 为原链历史长度），被撤回批次的记录带 `withdrawn=true`
+    及撤回引用；`effective_chain_length` 为按撤回链排除后的有效长度。
+    `?effective_only=true` 时仅返回有效记录（列表长度等于 effective_chain_length）。
 
     每条记录同时呈现：
     - `voucher_digest`：原交接记录上的凭证摘要（永不改写）；
@@ -838,10 +1410,18 @@ def list_handovers(exhibit_id: str):
             (exhibit_id,),
         ).fetchall()
         trail_map = _load_corrections_by_target(conn, exhibit_id)
+        withdrawals = _load_withdrawals(conn, exhibit_id)
 
+    wd_by_batch = {w["batch_id"]: w for w in withdrawals}
     records = []
+    effective_count = 0
     for r in rows:
         trail = trail_map.get(r["chain_seq"], [])
+        wd = wd_by_batch.get(r["batch_id"])
+        if wd is None:
+            effective_count += 1
+        if effective_only and wd is not None:
+            continue
         records.append({
             "chain_seq": r["chain_seq"],
             "batch_id": str(r["batch_id"]),
@@ -859,8 +1439,15 @@ def list_handovers(exhibit_id: str):
             "created_at": r["created_at"],
             "current_voucher_digest": _current_digest(r["voucher_digest"], trail),
             "correction_trail": trail,
+            "withdrawn": wd is not None,
+            "withdrawal": _withdrawal_ref(wd) if wd else None,
         })
-    return {"exhibit_id": exhibit_id, "chain_length": len(records), "records": records}
+    return {
+        "exhibit_id": exhibit_id,
+        "chain_length": len(rows),
+        "effective_chain_length": effective_count,
+        "records": records,
+    }
 
 
 @app.get("/api/v1/exhibits/{exhibit_id}/audit/verify", response_model=AuditVerifyOut, tags=["audit"])
@@ -891,25 +1478,35 @@ def verify_audit_chain(exhibit_id: str):
         corrections_block = _verify_corrections_chain(
             conn, exhibit, handover_by_seq, handover_result["honest"]
         )
+        withdrawals_result = _verify_withdrawals_chain(
+            conn, exhibit, records, handover_result["honest"]
+        )
 
     handover_block = handover_result["block"]
-    both_valid = handover_block["valid"] and corrections_block["valid"]
-    if both_valid:
-        detail = "交接链与补正链均完整；补正链各环锚点与原交接记录一致"
+    withdrawals_block = withdrawals_result["block"]
+    all_valid = handover_block["valid"] and corrections_block["valid"] and withdrawals_block["valid"]
+    if all_valid:
+        detail = "交接链、补正链与撤回链均完整；补正/撤回锚点与原交接记录一致，撤回后有效状态正确"
     elif not handover_block["valid"]:
         detail = handover_block["detail"]
-    else:
+    elif not corrections_block["valid"]:
         detail = corrections_block["detail"]
+    else:
+        detail = withdrawals_block["detail"]
 
+    effective_info = withdrawals_result.get("effective") or {}
     return {
         "exhibit_id": exhibit_id,
         "chain_length": handover_block["chain_length"],
-        "valid": both_valid,
+        "valid": all_valid,
         "first_invalid_seq": handover_block["first_invalid_seq"],
         "detail": detail,
         "correction_chain_length": corrections_block["chain_length"],
+        "withdrawal_chain_length": withdrawals_block["chain_length"],
+        "effective_chain_length": effective_info.get("effective_chain_length"),
         "handover_chain": handover_block,
         "corrections_chain": corrections_block,
+        "withdrawals_chain": withdrawals_block,
     }
 
 
@@ -918,7 +1515,7 @@ def list_batches(
     exhibit_id: str,
     status: str | None = Query(default=None, pattern="^(ACCEPTED|REJECTED)$"),
 ):
-    """查询展品的批次历史（含被驳回批次，供审计追溯）。"""
+    """查询展品的批次历史（含被驳回与已撤回批次，供审计追溯）。"""
     sql = """
         SELECT batch_id, status, report, created_at
           FROM batches
@@ -931,6 +1528,11 @@ def list_batches(
     sql += " ORDER BY created_at, batch_id"
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
+        wd_rows = conn.execute(
+            "SELECT * FROM batch_withdrawals WHERE exhibit_id = %s",
+            (exhibit_id,),
+        ).fetchall()
+    wd_by_batch = {w["batch_id"]: w for w in wd_rows}
     return [
         {
             "batch_id": str(r["batch_id"]),
@@ -938,6 +1540,9 @@ def list_batches(
             "record_count": r["report"]["record_count"],
             "first_break": r["report"]["first_break"],
             "created_at": r["created_at"],
+            "withdrawn": r["batch_id"] in wd_by_batch,
+            "withdrawal": _withdrawal_ref(wd_by_batch[r["batch_id"]])
+            if r["batch_id"] in wd_by_batch else None,
         }
         for r in rows
     ]

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 端到端调用示例：登记展品 -> 预演 -> 凭令牌提交 -> 幂等重试 -> 冲突检测 ->
 # 提交违规批次（不落记录）-> 令牌失效与重新预演 -> 查询交接链 -> 哈希链审计校验 ->
-# 凭证摘要补正（拒绝/冲突/幂等/独立补正链）-> 双链审计。
+# 凭证摘要补正（拒绝/冲突/幂等/独立补正链）-> 双链审计 ->
+# 已受理批次撤回（拒绝/幂等/独立撤回链/有效状态回退）-> 三链审计。
 # 用法：BASE=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -217,4 +218,111 @@ curl -s -D /tmp/corr21.hdr -X POST "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handov
   -H "Idempotency-Key: ${KEY_C1}" \
   -d "{\"expected_digest\":\"${D_ORIG}\",\"new_digest\":\"${D_NEW1}\",\"reason\":\"凭证摘要录入笔误，据馆方复核原件更正（复核单 CR-2026-1001）\"}" | pp
 grep -i '^HTTP/' /tmp/corr21.hdr
+
+# 从 JSON 响应抽取字段（有 jq 用 jq，无 jq 退化为 grep/sed）
+json_field() {
+  local field="$1"
+  if [ -n "${JQ}" ]; then jq -r --arg f "${field}" '.[$f]'; else
+    grep -oE "\"${field}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 \
+      | sed -E "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/"; fi
+}
+
+KEY_W1="demo-wd1-${EXHIBIT_ID}"
+KEY_W2="demo-wd2-${EXHIBIT_ID}"
+
+echo; echo "== 22) 再提交一笔已受理批次（陈晨 -> 周敏），作为待撤回的最新批次 =="
+BATCH_WD="$(curl -s -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: demo-wd-batch-${EXHIBIT_ID}" \
+  -d '{"exhibit_id":"'"${EXHIBIT_ID}"'","records":[{"location":"西安博物院库房","from_person":"陈晨","to_person":"周敏","seal_no":"SEAL-SH-1002","occurred_at":"2026-09-06T09:00:00+08:00","voucher_digest":"sha256:3344556677889900112233445566778899001122334455667788990011223344"}]}' \
+  | json_field batch_id)"
+echo "待撤回批次：${BATCH_WD}"
+[ -n "${BATCH_WD}" ] || { echo "未取到批次号，终止"; exit 1; }
+
+echo; echo "== 23) 撤回该批次：201，返回撤回后的有效状态（保管人回退为陈晨，原链历史长度不变）=="
+curl -s -X POST "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batch-withdrawals" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_W1}" \
+  -d "{\"batch_id\":\"${BATCH_WD}\",\"reason\":\"交接批次误登记，撤回后重新核对凭证再提交（复核单 WD-2026-1001）\"}" | pp
+
+echo; echo "== 24) 同键同载荷重试：返回首次撤回结果（200, idempotent_replay=true）=="
+curl -s -D /tmp/wd24.hdr -X POST "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batch-withdrawals" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_W1}" \
+  -d "{\"batch_id\":\"${BATCH_WD}\",\"reason\":\"交接批次误登记，撤回后重新核对凭证再提交（复核单 WD-2026-1001）\"}" | pp
+grep -i '^HTTP/' /tmp/wd24.hdr
+
+echo; echo "== 25) 展品当前状态：保管人/封签按撤回后计算，chain_length（原链历史长度）仍为 4，有效链长 3 =="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}" | pp
+
+echo; echo "== 26) 撤回拒绝用例：更晚批次(409) / 补正引用(409) / 批次被驳回(409) / 原因空(422) / 同键异载荷(409) =="
+# 26a) 被补正引用：第 3 环属于最初的 3 记录批次（已被两笔补正引用），先重新提交一笔再制造更晚批次
+BATCH_FRESH="$(curl -s -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: demo-wd-fresh-${EXHIBIT_ID}" \
+  -d '{"exhibit_id":"'"${EXHIBIT_ID}"'","records":[{"location":"西安博物院库房","from_person":"陈晨","to_person":"吴迪","seal_no":"SEAL-SH-1002","occurred_at":"2026-09-07T09:00:00+08:00","voucher_digest":"sha256:4455667788990011223344556677889900aabbccddeeff001122334455667788"}]}' \
+  | json_field batch_id)"
+# 取最初 3 记录批次号（第 3 环所在批次）
+BATCH_CORR="$(curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers/3" | json_field batch_id)"
+curl -s -o /dev/null -w '存在更晚已受理批次时撤旧批次 -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batch-withdrawals" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-wd-older-${EXHIBIT_ID}" \
+  -d "{\"batch_id\":\"${BATCH_CORR}\",\"reason\":\"试图撤回旧批次\"}"
+# 26b) 目标批次被补正引用：先撤回最新批次，再撤被补正引用的旧批次
+curl -s -o /dev/null -X POST "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batch-withdrawals" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: ${KEY_W2}" \
+  -d "{\"batch_id\":\"${BATCH_FRESH}\",\"reason\":\"为演示补正引用拦截先撤回最新批次\"}"
+curl -s -o /dev/null -w '批次已被补正单引用           -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batch-withdrawals" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-wd-corr-${EXHIBIT_ID}" \
+  -d "{\"batch_id\":\"${BATCH_CORR}\",\"reason\":\"该批次已有补正，应被拒绝\"}"
+# 26c) 批次被驳回
+REJECTED_BATCH="$(curl -s -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: demo-wd-rejb-${EXHIBIT_ID}" \
+  -d '{"exhibit_id":"'"${EXHIBIT_ID}"'","records":[{"location":"x","from_person":"陌生人","to_person":"b","seal_no":"S","occurred_at":"2026-09-08T09:00:00+08:00","voucher_digest":"bad"}]}' \
+  | json_field batch_id)"
+curl -s -o /dev/null -w '撤回被驳回批次               -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batch-withdrawals" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-wd-rej-${EXHIBIT_ID}" \
+  -d "{\"batch_id\":\"${REJECTED_BATCH}\",\"reason\":\"x\"}"
+# 26d) 原因为空
+curl -s -o /dev/null -w '撤回原因为空                 -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batch-withdrawals" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-wd-empty-${EXHIBIT_ID}" \
+  -d "{\"batch_id\":\"${BATCH_CORR}\",\"reason\":\"   \"}"
+# 26e) 目标不存在 / 批次号格式非法
+curl -s -o /dev/null -w '撤回不存在批次               -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batch-withdrawals" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-wd-miss-${EXHIBIT_ID}" \
+  -d '{"batch_id":"9f9c646e-0000-0000-0000-000000000000","reason":"x"}'
+curl -s -o /dev/null -w '批次号格式非法               -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batch-withdrawals" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-wd-badid-${EXHIBIT_ID}" \
+  -d '{"batch_id":"not-a-uuid","reason":"x"}'
+# 26f) 同键异载荷
+curl -s -o /dev/null -w '同键异载荷                   -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batch-withdrawals" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: ${KEY_W1}" \
+  -d "{\"batch_id\":\"${BATCH_WD}\",\"reason\":\"换一个撤回原因\"}"
+
+echo; echo "== 27) 交接链查询：被撤回批次记录仍完整保留（withdrawn=true），原链历史长度 4、有效链长 3 =="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers" | pp
+echo "--- 仅有效交接记录（?effective_only=true）---"
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers?effective_only=true" | pp
+
+echo; echo "== 28) 撤回链列表（撤回时序，可按批次过滤）=="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batch-withdrawals" | pp
+
+echo; echo "== 29) 撤回后继续提交：业务校验以撤回后有效状态（陈晨持有）为基准，原链仍物理追加 =="
+curl -s -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: demo-wd-cont-${EXHIBIT_ID}" \
+  -d '{"exhibit_id":"'"${EXHIBIT_ID}"'","records":[{"location":"南京博物院回程交接区","from_person":"陈晨","to_person":"周敏","seal_no":"SEAL-SH-1002","occurred_at":"2026-09-09T09:00:00+08:00","voucher_digest":"sha256:556677889900aabbccddeeff0011223344556677889900aabbccddeeff00112233"}]}' | pp
+
+echo; echo "== 30) 三链审计复算（交接链 + 补正链 + 撤回链；原链历史不删除，有效状态按撤回后计算）=="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/audit/verify" | pp
+
+echo; echo "== 31) 批次历史：已撤回批次带 withdrawn 标记与撤回引用 =="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batches" | pp
 

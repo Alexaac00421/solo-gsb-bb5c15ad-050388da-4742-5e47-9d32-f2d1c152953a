@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 GENESIS_HASH = "GENESIS"
 # 补正链独立的创世前驱哈希：补正按展品另起一条链，不接在交接链尾
 CORRECTIONS_GENESIS_HASH = "CORRECTIONS_GENESIS"
+# 撤回链独立的创世前驱哈希：撤回只追加不可变记录，原交接记录与原链恒不变
+WITHDRAWALS_GENESIS_HASH = "WITHDRAWALS_GENESIS"
 
 
 def canonical_json(obj) -> bytes:
@@ -129,6 +131,55 @@ def correction_hash(
         "new_digest": new_digest,
         "reason": (reason or "").strip(),
         "anchor_record_hash": anchor_record_hash,
+        "created_at": norm_ts(created_at),
+    }
+    return sha256_hex(canonical_json(payload))
+
+
+def withdrawal_request_hash(
+    exhibit_id: str,
+    batch_id,
+    reason: str,
+) -> str:
+    """撤回请求体指纹：用于幂等键下检测「同键不同载荷」。"""
+    payload = {
+        "exhibit_id": exhibit_id,
+        "batch_id": str(batch_id),
+        "reason": (reason or "").strip(),
+    }
+    return sha256_hex(canonical_json(payload))
+
+
+def withdrawal_hash(
+    *,
+    prev_hash: str,
+    withdrawal_id,
+    exhibit_id: str,
+    withdrawal_seq: int,
+    batch_id,
+    reason: str,
+    anchor_record_hashes: list[str],
+    created_at: datetime,
+) -> str:
+    """单条撤回记录的链式哈希：
+
+        withdrawal_hash = sha256(prev_hash ‖ 撤回业务字段 ‖
+                                  被撤回批次全部交接记录 record_hash 锚点列表)
+
+    撤回链按展品独立成链（首环 prev_hash = WITHDRAWALS_GENESIS），
+    每环按 chain_seq 有序锚定被撤回批次的全部交接记录 record_hash：
+    原交接记录被篡改、撤回记录被改写、删除或乱序，都会使撤回链复算失败。
+    撤回只追加本记录，原交接记录与其 record_hash 永不删除、永不改写。
+    """
+    payload = {
+        "prev_hash": prev_hash,
+        "kind": "batch_withdrawal",
+        "withdrawal_id": str(withdrawal_id),
+        "exhibit_id": exhibit_id,
+        "withdrawal_seq": withdrawal_seq,
+        "batch_id": str(batch_id),
+        "reason": (reason or "").strip(),
+        "anchor_record_hashes": list(anchor_record_hashes),
         "created_at": norm_ts(created_at),
     }
     return sha256_hex(canonical_json(payload))

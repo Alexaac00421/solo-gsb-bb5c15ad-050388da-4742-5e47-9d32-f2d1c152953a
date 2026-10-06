@@ -14,6 +14,13 @@ CREATE TABLE IF NOT EXISTS exhibits (
     -- 补正链：按展品独立成链，与交接链互不影响（补正不改动上述交接链字段）
     correction_chain_length BIGINT NOT NULL DEFAULT 0,
     correction_head_hash    TEXT   NOT NULL DEFAULT 'CORRECTIONS_GENESIS',
+    -- 撤回链：按展品独立成链，只追加不可变撤回记录；撤回不改写原交接链
+    withdrawal_chain_length BIGINT NOT NULL DEFAULT 0,
+    withdrawal_head_hash    TEXT   NOT NULL DEFAULT 'WITHDRAWALS_GENESIS',
+    -- 登记时的保管人/初始封签：撤回首站批次后当前状态回退到的基准
+    -- （旧卷迁移数据可能为 NULL；首站曾换签时以首环封签兜底）
+    registered_custodian    TEXT,
+    registered_initial_seal TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -79,9 +86,37 @@ CREATE TABLE IF NOT EXISTS digest_corrections (
 CREATE INDEX IF NOT EXISTS idx_corr_exhibit_seq ON digest_corrections (exhibit_id, correction_seq);
 CREATE INDEX IF NOT EXISTS idx_corr_target ON digest_corrections (exhibit_id, target_chain_seq, correction_seq);
 
+-- 已受理交接批次撤回：按展品形成独立哈希链，每环锚定被撤回批次的全部交接记录
+-- record_hash（按 chain_seq 有序）。撤回永不删除/改写原交接记录与其哈希，
+-- 也不改动 exhibits.chain_length/chain_head_hash（原链历史长度保持不变）；
+-- 展品当前保管人/封签/最近时间回退到被撤回批次之前的状态，
+-- 有效交接列表按撤回链排除被撤回批次后计算。
+CREATE TABLE IF NOT EXISTS batch_withdrawals (
+    withdrawal_id        UUID        PRIMARY KEY,
+    idempotency_key      TEXT        NOT NULL,            -- 调用方幂等键（全局唯一）
+    exhibit_id           TEXT        NOT NULL REFERENCES exhibits (exhibit_id),
+    batch_id             UUID        NOT NULL REFERENCES batches (batch_id),  -- 被撤回批次
+    reason               TEXT        NOT NULL,            -- 撤回原因（非空）
+    anchor_record_hashes JSONB       NOT NULL,            -- 锚点：被撤回批次全部交接记录 record_hash（按 chain_seq 有序）
+    withdrawal_seq       BIGINT      NOT NULL,            -- 展品级撤回链序号（1 起，连续）
+    prev_hash            TEXT        NOT NULL,            -- 前一环撤回 record_hash（首环为 WITHDRAWALS_GENESIS）
+    record_hash          TEXT        NOT NULL,            -- 本环撤回哈希（含 prev_hash 与锚点）
+    request_hash         TEXT        NOT NULL,            -- 请求指纹（同键不同载荷 -> 409）
+    result               JSONB       NOT NULL,            -- 首次受理响应快照（幂等重放原样返回）
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (exhibit_id, withdrawal_seq),
+    UNIQUE (idempotency_key),
+    UNIQUE (record_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_wd_exhibit_seq ON batch_withdrawals (exhibit_id, withdrawal_seq);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_wd_batch ON batch_withdrawals (batch_id);
+
 -- 种子数据：两件已登记展品，便于开箱即测
-INSERT INTO exhibits (exhibit_id, name, home_location, custodian, current_seal)
+INSERT INTO exhibits (exhibit_id, name, home_location, custodian, current_seal,
+                      registered_custodian, registered_initial_seal)
 VALUES
-    ('EX-0001', '商代青铜爵',   '故宫博物院地下库房A区', '张伟', 'SEAL-BJ-0001'),
-    ('EX-0002', '唐代三彩马',   '国家博物馆一层库房',   '王芳', 'SEAL-BJ-0002')
+    ('EX-0001', '商代青铜爵',   '故宫博物院地下库房A区', '张伟', 'SEAL-BJ-0001',
+     '张伟', 'SEAL-BJ-0001'),
+    ('EX-0002', '唐代三彩马',   '国家博物馆一层库房',   '王芳', 'SEAL-BJ-0002',
+     '王芳', 'SEAL-BJ-0002')
 ON CONFLICT (exhibit_id) DO NOTHING;

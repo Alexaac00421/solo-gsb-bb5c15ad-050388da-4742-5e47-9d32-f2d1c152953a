@@ -1,6 +1,6 @@
 # 文物借展封签交接核验服务
 
-Python (FastAPI) + PostgreSQL 实现的借展交接核验服务。调用方提交展品编号及按时间排列的交接记录（地点、交出人、接收人、封签号、时间、凭证摘要），服务完成规则核验、幂等写入与哈希链审计；已入链交接记录的凭证摘要录错时，馆方可提交**补正单**更正——原交接记录与其 `record_hash` 永不改写，补正按展品独立成链并锚定原记录。
+Python (FastAPI) + PostgreSQL 实现的借展交接核验服务。调用方提交展品编号及按时间排列的交接记录（地点、交出人、接收人、封签号、时间、凭证摘要），服务完成规则核验、幂等写入与哈希链审计；已入链交接记录的凭证摘要录错时，馆方可提交**补正单**更正——原交接记录与其 `record_hash` 永不改写，补正按展品独立成链并锚定原记录。馆方还可对**最新且已受理、未被补正引用的交接批次**提交**撤回**——撤回同样只追加不可变撤回记录（展品独立撤回哈希链），原交接记录与原链历史长度不变，展品当前保管人、封签与有效交接列表按撤回后状态计算。
 
 ## 功能特性
 
@@ -11,6 +11,7 @@ Python (FastAPI) + PostgreSQL 实现的借展交接核验服务。调用方提�
 - **事务原子性**：核验失败的批次**不写入任何交接记录**、不推进链上状态（仅落核验报告供幂等重试与审计追溯）
 - **可查询审计链**：每条交接记录携带 `prev_hash` / `record_hash` 构成哈希链，提供链查询与完整性复算接口
 - **凭证摘要补正**：对已入链记录提交补正单（展品编号、链序号、预期当前有效摘要、新摘要、补正原因、幂等键）；原记录与 `record_hash` 不改写，补正按展品另成一条哈希链、每环锚定被补正原记录；交接查询同时呈现**原摘要 / 当前有效摘要 / 补正轨迹**，审计同时复算两条链并定位首个失效环
+- **已受理批次撤回**：对展品**最新且 ACCEPTED、未被补正引用**的交接批次提交撤回（展品编号、批次号、撤回原因、幂等键）；存在更晚已受理批次、目标不存在、批次被驳回或原因为空时拒绝。撤回**不删除、不改写**原交接记录与哈希，只追加不可变撤回记录（展品独立撤回哈希链，锚定被撤回批次全部记录的 `record_hash`）；**原链历史长度保持不变**，展品当前保管人/封签/最近时间与有效交接列表按撤回后状态重算，审计同时复算**交接链、补正链、撤回链**三条链
 - **逐项诊断**：输出核验状态、首个断点（first_break）及每条记录的全部不合格原因
 
 ## 快速开始
@@ -25,7 +26,7 @@ docker compose up --build
 - PostgreSQL: localhost:5432 （用户/密码 `app`/`app`，库 `seals`）
 - `db/init.sql` 在数据库首次启动时自动执行，建表并写入两件种子展品（`EX-0001`、`EX-0002`）
 
-一键跑通完整演示（登记展品 → 预演取令牌 → 凭令牌提交 → 幂等重试 → 令牌失效/非法 → 409 冲突 → 违规批次 → 链查询 → 审计校验 → 凭证摘要补正与双链审计）：
+一键跑通完整演示（登记展品 → 预演取令牌 → 凭令牌提交 → 幂等重试 → 令牌失效/非法 → 409 冲突 → 违规批次 → 链查询 → 审计校验 → 凭证摘要补正与双链审计 → 已受理批次撤回与三链审计）：
 
 ```bash
 ./examples/demo.sh
@@ -69,8 +70,10 @@ docker compose up --build
 | GET | `/api/v1/exhibits/{id}/handovers/{seq}` | 查询单个交接环节（原摘要、当前有效摘要、补正轨迹） |
 | POST | `/api/v1/exhibits/{id}/handovers/{seq}/digest-corrections` | **提交凭证摘要补正单**（需 `Idempotency-Key` 头） |
 | GET | `/api/v1/exhibits/{id}/digest-corrections` | 查询补正链（可按 `chain_seq` 过滤被补正环节） |
-| GET | `/api/v1/exhibits/{id}/audit/verify` | 同时复算交接链与补正链，校验完整性并定位首个失效环 |
-| GET | `/api/v1/exhibits/{id}/batches` | 批次历史（含被驳回批次，可按 `status` 过滤） |
+| POST | `/api/v1/exhibits/{id}/batch-withdrawals` | **撤回最新已受理交接批次**（请求体含批次号与撤回原因，需 `Idempotency-Key` 头） |
+| GET | `/api/v1/exhibits/{id}/batch-withdrawals` | 查询撤回链（可按 `batch_id` 过滤被撤回批次） |
+| GET | `/api/v1/exhibits/{id}/audit/verify` | 同时复算交接链、补正链与撤回链，校验完整性并定位首个失效环 |
+| GET | `/api/v1/exhibits/{id}/batches` | 批次历史（含被驳回、已撤回批次，可按 `status` 过滤） |
 
 ## 调用示例
 
@@ -185,7 +188,7 @@ curl http://localhost:8000/api/v1/exhibits/EX-0001/handovers
 curl http://localhost:8000/api/v1/exhibits/EX-0001/audit/verify
 ```
 
-`audit/verify` 逐条复算交接链 `record_hash = sha256(prev_hash ‖ 规范化业务字段)`，并同时复算补正链（见下节）；任何篡改、删除、乱序都会在对应链块定位到首个失效环：
+`audit/verify` 逐条复算交接链 `record_hash = sha256(prev_hash ‖ 规范化业务字段)`，并同时复算补正链与撤回链（见后两节）；任何篡改、删除、乱序都会在对应链块定位到首个失效环：
 
 ```json
 {
@@ -193,9 +196,12 @@ curl http://localhost:8000/api/v1/exhibits/EX-0001/audit/verify
   "chain_length": 3,
   "valid": true,
   "first_invalid_seq": null,
-  "detail": "交接链与补正链均完整；补正链各环锚点与原交接记录一致",
+  "detail": "交接链、补正链与撤回链均完整；补正/撤回锚点与原交接记录一致，撤回后有效状态正确",
   "correction_chain_length": 0,
+  "withdrawal_chain_length": 0,
+  "effective_chain_length": 3,
   "corrections_chain": {"chain_length": 0, "head_hash": "CORRECTIONS_GENESIS", "valid": true, "first_invalid_seq": null, "detail": "补正哈希链完整，各环锚点与原交接记录一致"},
+  "withdrawals_chain": {"chain_length": 0, "head_hash": "WITHDRAWALS_GENESIS", "valid": true, "first_invalid_seq": null, "detail": "撤回哈希链完整，各环锚点与原交接记录一致，撤回后有效状态正确"},
   "handover_chain": {"chain_length": 3, "head_hash": "…", "valid": true, "first_invalid_seq": null, "detail": "交接哈希链完整，与展品当前状态一致"}
 }
 ```
@@ -249,46 +255,118 @@ curl 'http://localhost:8000/api/v1/exhibits/EX-0001/digest-corrections?chain_seq
 
 **不变性**：补正只追加 `digest_corrections` 行并推进展品的 `correction_chain_length`/`correction_head_hash`，**不改动** `chain_length`/`chain_head_hash`、不改 custodian/seal/last_time，因此补正**不推进交接链、不使既有预演令牌失效**；原 `/handover-batches` 提交接口及其响应字段完全保持兼容（交接链查询仅新增字段，不改动既有字段）。
 
+### 8. 已受理批次撤回
+
+馆方发现**整笔已受理交接批次**登记有误（而非单条凭证摘要笔误）时，可撤回该展品**最新且 `ACCEPTED`、尚未被补正引用**的批次。撤回是**只追加**操作：
+
+- 原交接记录与其 `record_hash` **永不删除、永不改写**，`batches` 报告也原样保留；
+- 新增一条不可变撤回记录，按展品另成一条**撤回哈希链**（首环 `prev_hash = WITHDRAWALS_GENESIS`），每环锚定被撤回批次**全部交接记录**的 `record_hash`（按 `chain_seq` 有序）；
+- 展品原交接链 `chain_length` / `chain_head_hash` **保持不变**（原链历史长度不变，仍是完整可复算的追加式哈希链）；
+- 展品当前保管人、封签、最近时间与「有效交接列表」**按撤回后状态重算**：回退到被撤回批次之前；全部批次撤回后回退到登记保管人/初始封签。
+
+请求体字段：`batch_id`（被撤回批次号，UUID）、`reason`（撤回原因，非空）；另需 `Idempotency-Key` 请求头。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/exhibits/EX-0001/batch-withdrawals \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: wd-2026-0001' \
+  -d '{"batch_id":"51c1a0e9-…","reason":"交接批次误登记，撤回后重新核对凭证再提交（复核单 WD-2026-1001）"}'
+```
+
+首次受理返回 **201**，撤回记录按展品独立成链，并回带被撤回批次的全部锚点与撤回后的有效状态：
+
+```json
+{
+  "withdrawal_id": "…", "exhibit_id": "EX-0001", "batch_id": "…",
+  "reason": "交接批次误登记…",
+  "anchor_record_hashes": ["e4b4dd23…"],
+  "withdrawal_seq": 1, "prev_hash": "WITHDRAWALS_GENESIS", "record_hash": "9c77f0a1…",
+  "idempotent_replay": false, "created_at": "2026-10-06T09:00:00.000000Z",
+  "chain_length": 3, "effective_chain_length": 2,
+  "custodian": "王强", "current_seal": "SEAL-SH-1002",
+  "last_time": "2026-09-03T06:30:00.000000Z"
+}
+```
+
+受理与拒绝规则：
+
+| 情形 | 结果 |
+|---|---|
+| 目标展品不存在 / 批次不存在 / 批次不属于该展品 | `404` |
+| 撤回原因为空（含纯空白）、批次号不是 UUID | `422` |
+| 批次状态为 `REJECTED`（被驳回） | `409` |
+| 存在比目标更晚的**未撤回**已受理批次（目标不是最新） | `409` |
+| 目标批次的任一交接记录已被补正单引用 | `409` |
+| 该批次已被撤回（换新幂等键重复撤回） | `409` |
+| 同键同载荷重试 | 首次撤回结果，`200` + `idempotent_replay=true` |
+| 同键异载荷 | `409` |
+
+撤回按**栈式**展开：撤回最新批次后，前一批次即成为新的「最新未撤回已受理批次」，可继续撤回，直至有效链清空（回退登记状态）。幂等重放**优先于一切业务校验**：即使该批次在此后又被其他请求撤回/操作，同键同载荷仍先返回首次撤回结果。
+
+**撤回后继续交接**：新批次的规则核验（交出人衔接、时间递增、封签连续性、首站校验）以**撤回后的有效状态**为参照；通过后记录仍**线性追加在原交接链物理链尾**（`chain_seq` 连续、`prev_hash` 指向上一物理环，含已撤回历史环）——原链是完整不可变的追加式历史，撤回只由旁路撤回链标记逻辑失效。因此**原链历史长度保持不变**，审计对原链的复算不被撤回影响。
+
+**与预演令牌的关系**：令牌快照绑定原交接链的 `chain_length`/`chain_head_hash`。撤回不增删原交接记录，故这两个值不变，旧令牌**不会**报 409/400；但业务参照状态已回退，沿用旧意图提交会按撤回后有效状态被 `REJECTED`，调用方应重新 `/rehearse` 后再提交（撤回后有效链为空时，预演/提交按首站规则，须以登记馆藏地、登记保管人为起点）。
+
+**查询**：
+
+```bash
+# 完整原链历史：chain_length 为历史长度，被撤回记录带 withdrawn=true 与撤回引用
+curl http://localhost:8000/api/v1/exhibits/EX-0001/handovers
+# 仅撤回后的有效交接列表（长度等于 effective_chain_length）
+curl 'http://localhost:8000/api/v1/exhibits/EX-0001/handovers?effective_only=true'
+# 撤回链（可按被撤回批次过滤）
+curl 'http://localhost:8000/api/v1/exhibits/EX-0001/batch-withdrawals'
+curl 'http://localhost:8000/api/v1/exhibits/EX-0001/batch-withdrawals?batch_id=<uuid>'
+# 批次历史：已撤回批次带 withdrawn 与撤回引用
+curl http://localhost:8000/api/v1/exhibits/EX-0001/batches
+```
+
+交接链/单环节查询与批次历史仅**新增** `withdrawn` / `withdrawal`（及顶层 `effective_chain_length`）字段，既有字段不变；`GET /exhibits/{id}` 同样新增 `withdrawal_chain_length`、`withdrawal_head_hash`、`effective_chain_length`，`custodian`/`current_seal`/`last_time` 为撤回后有效值。查询与单笔补正接口的路径、方法、既有字段完全保持兼容。
+
+**审计**：`audit/verify` 同时复算三条链——交接链（原链历史，含已撤回记录）、补正链、撤回链。撤回链逐环重算 `record_hash = sha256(prev_hash ‖ 撤回业务字段 ‖ 被撤回批次全部原记录 record_hash 锚点 ‖ created_at)`，并校验：被撤回批次存在、属于该展品且为 `ACCEPTED`；锚点列表与该批次现存记录的存储哈希及诚实重算哈希逐条一致（原记录被删除/改写即在首个引用环报「锚定失效」）；链尾与展品撤回状态一致；按撤回链重放的有效保管人/封签/最近时间与展品当前列一致。
+
 ## 设计说明
 
 - **预演**：`POST /rehearse` 仅做一次普通 `SELECT` 读取展品当前状态，复用同一套 `validate_batch` 规则引擎；不落批次报告、不落交接记录、不推进展品状态，可安全重复调用。
-- **状态令牌**：`app/tokens.py` 实现的自包含 HMAC 令牌（`stv1.` 前缀），载荷为展品编号 + 签发时 `chain_length`/`chain_head_hash` 快照，密钥来自 `TOKEN_SECRET`，令牌不入库、无状态。提交时先在事务外校验格式/签名（无效即 `400`），再在展品行锁 `SELECT ... FOR UPDATE` 内比对归属与链快照（跨展品或链已推进即 `409`）——行锁保证「比对 → 推进」与其他成功批次互斥，不会读到推进途中的状态。补正只推进 `correction_*` 字段，令牌快照（交接链长度/链头）不变，故补正后令牌仍有效。
+- **状态令牌**：`app/tokens.py` 实现的自包含 HMAC 令牌（`stv1.` 前缀），载荷为展品编号 + 签发时 `chain_length`/`chain_head_hash` 快照，密钥来自 `TOKEN_SECRET`，令牌不入库、无状态。提交时先在事务外校验格式/签名（无效即 `400`），再在展品行锁 `SELECT ... FOR UPDATE` 内比对归属与链快照（跨展品或链已推进即 `409`）——行锁保证「比对 → 推进」与其他成功批次互斥，不会读到推进途中的状态。补正只推进 `correction_*` 字段，令牌快照（交接链长度/链头）不变，故补正后令牌仍有效。撤回只追加撤回链并回退展品有效状态（custodian/seal/last_time），同样不增删原交接记录，故 `chain_length`/`chain_head_hash` 不变、令牌快照比对仍通过；但业务参照状态已回退，沿用旧意图提交会按撤回后有效状态核验为 `REJECTED`，调用方须重新预演。
 - **幂等**：`batches.idempotency_key` 唯一约束 + `request_hash`（请求体规范化 JSON 的 SHA-256，携带令牌时令牌计入指纹）。同键同载荷直接返回已存报告（即使链已推进，令牌比对也不执行）；同键不同载荷 409；并发同键插入由唯一约束兜底，后到者按重试返回。补正单在 `digest_corrections.idempotency_key` 上同样全局唯一，配 `request_hash` 指纹；幂等预检在展品行锁前后各做一次——锁前快速重放，锁内串行化同键/同展品并发，使「同键同载荷并发」一笔 201、另一笔 200 重放，「异键同预期并发」仅一笔生效。
-- **原子性**：核验、批次报告、交接记录、展品链上状态推进全部在单事务内完成；`REJECTED` 批次仅落 `batches` 报告行（用于幂等重试返回同一结果与审计追溯），`handover_records` 与 `exhibits` 状态零变更；令牌 `400/409` 在报告写入前中止事务，批次表也不留痕。补正单与其链状态推进同样在单事务内完成；`404/409/422` 在写入前中止，不留任何补正行。
-- **并发一致性**：处理批次/补正时均对展品行 `SELECT ... FOR UPDATE`，串行化同一展品的链推进与补正。补正用「预期当前有效摘要」做 CAS：行锁内读取该环节当前有效摘要，与 `expected_digest` 不符即 `409`，因此不同幂等键以同一预期值并发补正同一环节时，先提交者生效，后提交者在锁内读到已更新的当前值而落败。
-- **交接哈希链**：首环 `prev_hash = GENESIS`，之后每环指向前环 `record_hash`；时间统一规范化为 UTC 微秒精度 `Z` 格式后参与哈希，保证写入与复算一致。
+- **原子性**：核验、批次报告、交接记录、展品链上状态推进全部在单事务内完成；`REJECTED` 批次仅落 `batches` 报告行（用于幂等重试返回同一结果与审计追溯），`handover_records` 与 `exhibits` 状态零变更；令牌 `400/409` 在报告写入前中止事务，批次表也不留痕。补正单与其链状态推进同样在单事务内完成；`404/409/422` 在写入前中止，不留任何补正行。撤回单、撤回链推进与展品有效状态回退也在同一单事务（同一展品行锁）内完成；全部拒绝（`404/409/422`）在写入前中止，不留撤回行。
+- **并发一致性**：处理批次/补正/撤回时均对展品行 `SELECT ... FOR UPDATE`，串行化同一展品的链推进、补正与撤回。补正用「预期当前有效摘要」做 CAS：行锁内读取该环节当前有效摘要，与 `expected_digest` 不符即 `409`，因此不同幂等键以同一预期值并发补正同一环节时，先提交者生效，后提交者在锁内读到已更新的当前值而落败。撤回收紧「最新未撤回已受理批次 + 未被补正引用」两个前置条件，配合 `batch_withdrawals.batch_id` 唯一约束：不同幂等键并发撤回同一批次仅一笔 201、其余 409，同键并发则一笔 201、一笔 200 重放。
+- **交接哈希链**：首环 `prev_hash = GENESIS`，之后每环指向前环 `record_hash`；时间统一规范化为 UTC 微秒精度 `Z` 格式后参与哈希，保证写入与复算一致。撤回不删除、不改写任何一环：撤回后新受理批次的记录仍线性追加在物理链尾（`prev_hash` 接物理上一环，可能是已撤回记录），因此原链始终是连续完整的追加式哈希链；哪些环节「当前有效」由旁路撤回链在查询/核验时计算。
 - **补正哈希链**：按展品独立成链，首环 `prev_hash = CORRECTIONS_GENESIS`；每环 `record_hash = sha256(prev_hash ‖ 补正业务字段 ‖ 被补正原记录 record_hash 锚点 ‖ created_at)`。补正不触碰 `handover_records`，原记录与原交接链恒不变。审计时对每条交接记录按其存储 `prev_hash` **独立**重算「诚实」`record_hash`（全量，不在断裂处中断）：补正环锚点须同时等于存储的原 `record_hash` 与重算出的诚实哈希——原记录内容被改写（即便连带伪造存储哈希列）也会在首个引用它的补正环报「锚定失效」。
-- **升级兼容**：`db/init.sql` 为全新库的完整结构；对已有数据卷，应用启动时 `app/migrations.py:ensure_schema()` 以 `ADD COLUMN IF NOT EXISTS` / `CREATE TABLE IF NOT EXISTS` 幂等补齐补正列与 `digest_corrections` 表，旧卷平滑升级、可重复执行。
+- **撤回哈希链**：按展品独立成链，首环 `prev_hash = WITHDRAWALS_GENESIS`；每环 `record_hash = sha256(prev_hash ‖ 撤回业务字段（withdrawal_id/batch_id/reason/seq/created_at）‖ 被撤回批次全部交接记录 record_hash 锚点列表)`。撤回不触碰 `handover_records`/`batches` 与原链头；审计时撤回环锚点列表须逐序等于该批次记录的存储哈希与诚实哈希——被撤回批次记录被删除、改写或乱序即在首个引用它的撤回环报「锚定失效」。审计还按撤回链重放有效链，校验展品当前 custodian/current_seal/last_time 与重放结果一致。有效状态为空（全部撤回）时回退到登记保管人/初始封签（旧卷迁移数据以首环交出人/封签兜底）。
+- **升级兼容**：`db/init.sql` 为全新库的完整结构；对已有数据卷，应用启动时 `app/migrations.py:ensure_schema()` 以 `ADD COLUMN IF NOT EXISTS` / `CREATE TABLE IF NOT EXISTS` 幂等补齐补正列与 `digest_corrections` 表、撤回列（`withdrawal_chain_length`/`withdrawal_head_hash`/`registered_custodian`/`registered_initial_seal`）与 `batch_withdrawals` 表，并对旧数据幂等回填登记保管人/初始封签，旧卷平滑升级、可重复执行。
 
 ## 本地开发与测试
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest tests/                 # 规则引擎、令牌、补正哈希单测（无数据库依赖）
+pytest tests/                 # 规则引擎、令牌、补正/撤回哈希单测（无数据库依赖）
 uvicorn app.main:app --reload # 需本地 PostgreSQL 并执行 db/init.sql（旧库启动时自动迁移）
 ```
 
-`tests/test_api_rehearsal.py`（预演/令牌）与 `tests/test_api_corrections.py`（凭证摘要补正）
-为端到端测试，需可达的 PostgreSQL，通过 `DATABASE_URL` 指定；数据库不可达时自动跳过：
+`tests/test_api_rehearsal.py`（预演/令牌）、`tests/test_api_corrections.py`（凭证摘要补正）
+与 `tests/test_api_withdrawals.py`（已受理批次撤回）为端到端测试，需可达的 PostgreSQL，
+通过 `DATABASE_URL` 指定；数据库不可达时自动跳过：
 
 ```bash
-DATABASE_URL='postgresql://app:app@localhost:5432/seals' pytest tests/test_api_rehearsal.py tests/test_api_corrections.py
+DATABASE_URL='postgresql://app:app@localhost:5432/seals' pytest tests/test_api_rehearsal.py tests/test_api_corrections.py tests/test_api_withdrawals.py
 ```
 
 ## 目录结构
 
 ```
 app/
-  main.py        # FastAPI 路由与事务编排（/rehearse、令牌校验、补正单与双链审计）
+  main.py        # FastAPI 路由与事务编排（/rehearse、令牌、补正单、批次撤回与三链审计）
   validation.py  # 规则引擎（纯标准库，可独立单测）
   tokens.py      # 展品状态令牌：签发/验签/链快照比对（纯标准库，可独立单测）
-  hashing.py     # 规范化序列化、请求指纹、交接哈希链与补正哈希链
-  migrations.py  # 启动时幂等迁移：旧卷补齐补正列与 digest_corrections 表
+  hashing.py     # 规范化序列化、请求指纹、交接/补正/撤回哈希链
+  migrations.py  # 启动时幂等迁移：旧卷补齐补正/撤回列与 digest_corrections/batch_withdrawals 表
   schemas.py     # 请求/响应模型
   db.py          # 连接与启动等待
 db/init.sql      # 建表 + 种子展品（Compose 首启自动执行）
-examples/        # accept/reject 示例载荷与端到端 demo.sh（含预演与补正流程）
-tests/           # 规则引擎、令牌、补正哈希单测与预演/补正端到端测试
+examples/        # accept/reject/correction/withdrawal 示例载荷与端到端 demo.sh（含补正与撤回流程）
+tests/           # 规则引擎、令牌、补正/撤回哈希单测与预演/补正/撤回端到端测试
 Dockerfile  docker-compose.yml  requirements*.txt
 ```
