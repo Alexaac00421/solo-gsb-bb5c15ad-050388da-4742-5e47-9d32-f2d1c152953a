@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 端到端调用示例：登记展品 -> 预演 -> 凭令牌提交 -> 幂等重试 -> 冲突检测 ->
 # 提交违规批次（不落记录）-> 令牌失效与重新预演 -> 查询交接链 -> 哈希链审计校验 ->
-# 凭证摘要补正（拒绝/冲突/幂等/独立补正链）-> 双链审计。
+# 凭证摘要补正（拒绝/冲突/幂等/独立补正链）-> 双链审计 ->
+# 已受理批次撤回（拒绝规则/幂等/原链不动/撤后重交/三链审计）。
 # 用法：BASE=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -14,7 +15,7 @@ extract_token() {
     sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\(stv1\.[^"]*\)".*/\1/p' | head -1; fi
 }
 
-EXHIBIT_ID="EX-DEMO-$(date +%s)"
+EXHIBIT_ID="EX-DEMO-$(date +%s)-${RANDOM}"
 KEY_OK="demo-ok-${EXHIBIT_ID}"
 KEY_BAD="demo-bad-${EXHIBIT_ID}"
 KEY_RH="demo-rh-${EXHIBIT_ID}"
@@ -217,4 +218,76 @@ curl -s -D /tmp/corr21.hdr -X POST "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handov
   -H "Idempotency-Key: ${KEY_C1}" \
   -d "{\"expected_digest\":\"${D_ORIG}\",\"new_digest\":\"${D_NEW1}\",\"reason\":\"凭证摘要录入笔误，据馆方复核原件更正（复核单 CR-2026-1001）\"}" | pp
 grep -i '^HTTP/' /tmp/corr21.hdr
+
+# ================================================================
+# 已受理交接批次撤回（独立展品，完整演示：撤回/拒绝/幂等/撤后重交/三链审计）
+# ================================================================
+WEX="EX-WD-DEMO-$(date +%s)-${RANDOM}"
+echo; echo "== 22) 撤回演示：登记展品 ${WEX} 并连续提交两个已受理批次 =="
+curl -s -X POST "${BASE}/api/v1/exhibits" \
+  -H 'Content-Type: application/json' \
+  -d "{\"exhibit_id\":\"${WEX}\",\"name\":\"撤回演示展品\",\"home_location\":\"南京博物院库房B区\",\"custodian\":\"张伟\",\"initial_seal\":\"SEAL-NJ-0001\"}" | pp
+
+curl -s -o /dev/null -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: wd-demo-b1-${WEX}" \
+  -d "{\"exhibit_id\":\"${WEX}\",\"records\":[{\"location\":\"南京博物院库房B区\",\"from_person\":\"张伟\",\"to_person\":\"李静\",\"seal_no\":\"SEAL-NJ-0001\",\"occurred_at\":\"2026-09-01T09:00:00+08:00\",\"voucher_digest\":\"sha256:$(printf 'ab%.0s' {1..32})\"}]}"
+curl -s -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: wd-demo-b2-${WEX}" \
+  -d "{\"exhibit_id\":\"${WEX}\",\"records\":[{\"location\":\"上海博物馆交接区\",\"from_person\":\"李静\",\"to_person\":\"王强\",\"seal_no\":\"SEAL-NJ-0001\",\"occurred_at\":\"2026-09-02T09:00:00+08:00\",\"voucher_digest\":\"sha256:$(printf 'cd%.0s' {1..32})\"}]}" > /tmp/wd-b2.json
+# 按批次列表出现顺序取 id（无 jq 时按对象逐个截取，避免贪婪匹配）
+WB1="$(curl -s "${BASE}/api/v1/exhibits/${WEX}/batches" | tr '}' '\n' | sed -n 's/.*"batch_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')"
+WB2="$(cat /tmp/wd-b2.json | sed -n 's/.*"batch_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+echo "批1=${WB1}；批2（最新受理批次）=${WB2}"
+
+echo; echo "== 23) 撤回非最新批次（批1，其后有批2）-> 409 =="
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${WEX}/handover-batches/${WB1}/withdraw" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: wd-demo-w1-${WEX}" \
+  -d '{"reason":"先撤早的批次"}'
+
+echo; echo "== 24) 撤回原因为空 -> 422 =="
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${WEX}/handover-batches/${WB2}/withdraw" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: wd-demo-empty-${WEX}" \
+  -d '{"reason":"   "}'
+
+echo; echo "== 25) 正式撤回最新受理批次批2：201，原链不动、追加撤回链一环 =="
+curl -s -X POST "${BASE}/api/v1/exhibits/${WEX}/handover-batches/${WB2}/withdraw" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: wd-demo-w2-${WEX}" \
+  -d @examples/withdraw.json | pp
+
+echo; echo "== 26) 同键同载荷重试：返回原撤回记录（200, idempotent_replay=true）=="
+curl -s -D /tmp/wd26.hdr -X POST "${BASE}/api/v1/exhibits/${WEX}/handover-batches/${WB2}/withdraw" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: wd-demo-w2-${WEX}" \
+  -d @examples/withdraw.json | pp
+grep -i '^HTTP/' /tmp/wd26.hdr
+
+echo; echo "== 27) 重复撤回同批次 -> 409；同键异载荷（换原因）-> 409 =="
+curl -s -o /dev/null -w '重复撤回             -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${WEX}/handover-batches/${WB2}/withdraw" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: wd-demo-again-${WEX}" \
+  -d '{"reason":"再撤一次"}'
+curl -s -o /dev/null -w '同键异载荷           -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${WEX}/handover-batches/${WB2}/withdraw" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: wd-demo-w2-${WEX}" \
+  -d '{"reason":"换一个撤回原因"}'
+
+echo; echo "== 28) 展品状态：保管人回滚为李静；物理链长=2 不变，有效链长=1 =="
+curl -s "${BASE}/api/v1/exhibits/${WEX}" | pp
+
+echo; echo "== 29) 交接列表：批2 记录仍在原链（withdrawn=true），active_chain_length=1 =="
+curl -s "${BASE}/api/v1/exhibits/${WEX}/handovers" | pp
+
+echo; echo "== 30) 撤回后重新提交：新批次在原链尾部继续追加（物理链长=3，有效链长=2）=="
+curl -s -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: wd-demo-b3-${WEX}" \
+  -d "{\"exhibit_id\":\"${WEX}\",\"records\":[{\"location\":\"南京博物院库房B区\",\"from_person\":\"李静\",\"to_person\":\"赵磊\",\"seal_no\":\"SEAL-NJ-0001\",\"occurred_at\":\"2026-09-10T09:00:00+08:00\",\"voucher_digest\":\"sha256:$(printf 'ef%.0s' {1..32})\"}]}" > /dev/null
+curl -s "${BASE}/api/v1/exhibits/${WEX}" | pp
+
+echo; echo "== 31) 撤回链列表与批次历史（带 withdrawn 标记）=="
+curl -s "${BASE}/api/v1/exhibits/${WEX}/batch-withdrawals" | pp
+curl -s "${BASE}/api/v1/exhibits/${WEX}/batches" | pp
+
+echo; echo "== 32) 三链审计复算（交接链 + 补正链 + 撤回链；valid=true）=="
+curl -s "${BASE}/api/v1/exhibits/${WEX}/audit/verify" | pp
 
